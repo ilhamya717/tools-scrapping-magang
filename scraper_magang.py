@@ -1,36 +1,21 @@
 """
-Scraper Info Magang - IT/Software/Data
-========================================
-Script ini mengambil info lowongan magang dari beberapa sumber (dengan
-beberapa query pencarian sekaligus, lihat QUERIES di bawah), lalu
-memfilter hanya yang relevan dengan bidang IT/Software/Data/Cybersecurity,
-dan menyimpan hasilnya ke file Excel.
+Scraper Info Magang - IT/Software/Data/Cybersecurity
+======================================================
+Ambil lowongan magang dari Kalibrr, LinkedIn, Glints, dan Jobstreet
+(multi-query, lihat QUERIES), filter yang relevan ke IT/Software/Data/
+Cybersecurity, simpan ke Excel. Detail & cara pakai ada di README.md.
 
-Sumber yang didukung: Kalibrr, LinkedIn, Glints, Jobstreet.
+Catatan penting:
+- Glints & Jobstreet wajib Selenium (full-JS render + Cloudflare).
+  Kalibrr & LinkedIn cukup pakai request biasa (endpoint publik).
+- LinkedIn: User Agreement mereka melarang scraping otomatis. Endpoint
+  guest yang dipakai di sini publik & tanpa login, tapi tetap ada risiko
+  IP diblokir kalau volume terlalu besar/sering - jangan naikkan
+  MAGANG_LINKEDIN_MAX_PAGES sembarangan.
+- Situs bisa berubah struktur kapan saja -> kalau satu sumber tiba-tiba
+  0 hasil, cek ulang selector-nya lewat Inspect Element / Network tab.
 
-CATATAN PENTING SEBELUM PAKAI:
-1. Situs job portal (Glints, Kalibrr, Jobstreet, dll) sering mengubah
-   struktur halaman/API mereka & punya proteksi anti-bot (Cloudflare, dsb).
-   Jadi script ini mungkin perlu di-update kalau ada perubahan di sisi mereka.
-2. Glints & Jobstreet full-JS render dan/atau ditutupi Cloudflare, jadi
-   KEDUANYA wajib pakai Selenium (bukan cuma fallback) -> perlu install
-   Google Chrome + chromedriver (otomatis lewat webdriver-manager).
-   Kalibrr & LinkedIn bisa pakai request biasa (endpoint publik).
-3. Selalu cek Terms of Service platform yang di-scrape. Gunakan dengan wajar
-   (jangan request terlalu cepat/banyak) supaya IP tidak diblokir.
-   -> KHUSUS LINKEDIN: User Agreement mereka EKSPLISIT melarang scraping
-   otomatis (bukan cuma proteksi teknis kayak sumber lain). Endpoint yang
-   dipakai di sini publik & tanpa login, tapi tetap ada risiko IP diblokir
-   kalau dipakai dengan volume besar/sering. Defaultnya sengaja dibatasi
-   kecil (lihat MAGANG_LINKEDIN_MAX_PAGES) - jangan dinaikkan sembarangan.
-4. KEYWORDS mencakup istilah cybersecurity (SOC, pentester, red/blue team,
-   dst), tapi keyword itu cuma MEMFILTER hasil pencarian - supaya lowongan
-   itu benar-benar ketemu, query pencarian yang dikirim ke tiap situs juga
-   harus relevan. Makanya QUERIES di bawah defaultnya sudah multi-query
-   (bukan cuma "magang it"). Override lewat MAGANG_QUERIES kalau perlu.
-
-Install dependency:
-    pip install requests beautifulsoup4 pandas openpyxl selenium webdriver-manager
+Install: pip install -r requirements.txt
 """
 
 import json
@@ -45,25 +30,8 @@ import requests
 from requests.adapters import HTTPAdapter, Retry
 
 # =========================================================
-# KONFIGURASI
+# KONFIGURASI (semua bisa dioverride lewat environment variable)
 # =========================================================
-# Bisa dioverride lewat environment variable, contoh (PowerShell):
-#   $env:MAGANG_QUERIES = "magang backend,magang soc analyst"
-#   $env:MAGANG_MAX_PAGES = "5"
-#   $env:MAGANG_MONTH_START = "8"
-#   $env:MAGANG_MONTH_END = "9"
-
-# QUERIES: daftar query pencarian yang dikirim ke tiap situs (satu run scraping
-# dilakukan PER query, hasilnya digabung & di-dedup di akhir). Ini penting -
-# KEYWORDS di bawah cuma memfilter hasil yang situs balikin, jadi kalau query
-# pencariannya cuma "magang it", lowongan seperti "SOC Analyst Internship"
-# (yang tidak mengandung kata "IT" di judul) kemungkinan besar tidak akan
-# pernah muncul di hasil pencarian situs sejak awal.
-#
-# - MAGANG_QUERIES (comma-separated) -> override penuh daftar query.
-# - MAGANG_QUERY (single, utk kompatibilitas lama) -> dipakai kalau
-#   MAGANG_QUERIES tidak di-set DAN env var ini memang di-set user.
-# - Kalau dua-duanya tidak di-set -> pakai default multi-query di bawah.
 _DEFAULT_QUERIES = ["magang it", "magang cyber security", "magang data"]
 
 if os.environ.get("MAGANG_QUERIES", "").strip():
@@ -73,22 +41,17 @@ elif os.environ.get("MAGANG_QUERY", "").strip():
 else:
     QUERIES = _DEFAULT_QUERIES
 
-QUERY = QUERIES[0]  # dipakai sebagai default param tunggal di beberapa fungsi/log ringkas
+QUERY = QUERIES[0]  # dipakai sebagai default param tunggal di beberapa fungsi
 MAX_PAGES = int(os.environ.get("MAGANG_MAX_PAGES", "3"))
-RAW_DUMP_DIR = os.environ.get("MAGANG_RAW_DIR", "")  # isi path kalau mau simpan raw response utk debug
+RAW_DUMP_DIR = os.environ.get("MAGANG_RAW_DIR", "")
 
-# Filter tanggal posting: hanya ambil lowongan yang di-posting di rentang bulan ini
-# (default Agustus-September tahun berjalan), supaya tidak kebanjiran postingan lama.
+# Filter tanggal posting (default Agustus-September tahun berjalan)
 DATE_FILTER_YEAR = int(os.environ.get("MAGANG_YEAR", str(datetime.now().year)))
-MONTH_START = int(os.environ.get("MAGANG_MONTH_START", "8"))   # Agustus
-MONTH_END = int(os.environ.get("MAGANG_MONTH_END", "9"))       # September
-# Lowongan yang tanggal postingnya tidak berhasil dideteksi -> default DIBUANG
-# (supaya filter beneran ketat). Set "true" kalau mau tetap disertakan.
+MONTH_START = int(os.environ.get("MAGANG_MONTH_START", "8"))
+MONTH_END = int(os.environ.get("MAGANG_MONTH_END", "9"))
 INCLUDE_UNKNOWN_DATE = os.environ.get("MAGANG_INCLUDE_UNKNOWN_DATE", "false").strip().lower() == "true"
 
-# Kata kunci untuk filter jurusan IT / Software / Data.
-# Dicek sebagai WHOLE WORD (bukan substring) supaya "it" tidak match "iterasi",
-# "ai" tidak match "air", "qa" tidak match "qariah", dst.
+# Keyword filter IT/Software/Data/Cybersecurity
 KEYWORDS = [
     "it", "informatika", "software", "developer", "programmer",
     "data", "data science", "data analyst", "machine learning",
@@ -96,7 +59,7 @@ KEYWORDS = [
     "full stack", "web developer", "mobile developer", "sistem informasi",
     "teknik komputer", "cyber security", "devops", "cloud", "qa", "quality assurance",
     "database", "sql", "python", "java", "javascript",
-    # -- Cybersecurity / Security Operations --
+    # Cybersecurity / Security Operations
     "cybersecurity", "cyber", "keamanan siber", "information security", "infosec",
     "security analyst", "security engineer", "security researcher",
     "soc", "security operation center", "security operations center",
@@ -111,12 +74,10 @@ KEYWORDS = [
     "bug bounty", "ctf",
 ]
 
-# Keyword yang wajib dianggap sebagai "kata utuh" (rawan false-positive kalau substring)
+# Keyword pendek/ambigu -> wajib whole-word match & cuma dicek di judul (lihat is_relevant)
 _STRICT_WORD_KEYWORDS = {
-    "it", "ai", "qa", "sql", "cloud", "data", "cyber",
+    "it", "ai", "qa", "sql", "cloud", "data", "cyber", "soc", "database",
     "l1", "l2", "l3", "iam", "ctf",
-    "soc",       # tanpa word-boundary nyangkut ke "social" (Social Media, dst)
-    "database",  # sama generiknya dengan "data" - sering muncul di deskripsi non-IT
 }
 
 HEADERS = {
@@ -137,8 +98,7 @@ logging.basicConfig(
 )
 log = logging.getLogger("scraper_magang")
 
-# Tanda-tanda halaman yang sebenarnya adalah proteksi anti-bot/captcha,
-# bukan hasil pencarian asli.
+# Penanda halaman anti-bot/captcha, bukan hasil pencarian asli
 ANTI_BOT_MARKERS = [
     "checking your browser", "cf-browser-verification", "attention required",
     "verify you are human", "captcha", "access denied", "just a moment",
@@ -151,7 +111,7 @@ def build_session() -> requests.Session:
     session.headers.update(HEADERS)
     retries = Retry(
         total=3,
-        backoff_factor=1.5,  # 0s, 1.5s, 3s, ...
+        backoff_factor=1.5,
         status_forcelist=[429, 500, 502, 503, 504],
         allowed_methods=["GET"],
         raise_on_status=False,
@@ -173,16 +133,14 @@ def dump_raw(name: str, content: str):
         return
     try:
         os.makedirs(RAW_DUMP_DIR, exist_ok=True)
-        path = os.path.join(RAW_DUMP_DIR, name)
-        with open(path, "w", encoding="utf-8") as f:
+        with open(os.path.join(RAW_DUMP_DIR, name), "w", encoding="utf-8") as f:
             f.write(content)
     except Exception as e:
         log.warning("Gagal simpan raw dump %s: %s", name, e)
 
 
-# Keyword untuk deteksi tipe kerja (Remote / Hybrid / On-site).
-# Urutan penting: cek Hybrid dulu supaya kalimat kayak "hybrid (WFH & WFO)"
-# tidak kepental jadi Remote gara-gara ada kata "wfh"/"remote" di situ juga.
+# Keyword deteksi tipe kerja. Hybrid dicek duluan karena kalimat "hybrid
+# (WFH & WFO)" bisa kepental jadi Remote gara-gara ada kata "wfh" juga.
 REMOTE_MARKERS = ["remote", "wfh", "work from home", "fully remote", "kerja dari rumah"]
 HYBRID_MARKERS = ["hybrid", "wfh & wfo", "wfh/wfo", "semi remote", "campuran"]
 ONSITE_MARKERS = ["on-site", "onsite", "wfo", "work from office", "di kantor"]
@@ -191,10 +149,8 @@ _keyword_patterns = None
 
 
 def _get_keyword_patterns():
-    """Compile regex sekali saja, dipisah jadi 2 grup:
-    - generic: keyword pendek/ambigu (whole word \\b...\\b) -> HANYA dicek di judul.
-    - specific: frasa/keyword panjang -> dicek di judul + deskripsi.
-    (Alasan pemisahan ada di docstring is_relevant().)"""
+    """Compile regex sekali saja, dipisah 2 grup: generic (keyword pendek/ambigu,
+    whole-word, cuma dicek di judul) dan specific (frasa, dicek di judul+deskripsi)."""
     global _keyword_patterns
     if _keyword_patterns is not None:
         return _keyword_patterns
@@ -211,17 +167,13 @@ def _get_keyword_patterns():
 
 
 def is_relevant(title: str, description: str = "") -> bool:
-    """Cek apakah lowongan relevan dengan IT/Software/Data/Cybersecurity.
+    """Cek relevansi ke IT/Software/Data/Cybersecurity.
 
-    Keyword pendek & ambigu (it, data, cloud, ai, qa, sql, cyber, l1-l3, iam, ctf)
-    HANYA dicek di JUDUL, bukan deskripsi -> deskripsi lowongan APAPUN (HR,
-    admin, gudang, marketing, dst) hampir selalu menyebut kata "data"/"IT"/
-    "cloud" secara insidental (mis. "input data pelanggan", "koordinasi
-    dengan tim IT", "aplikasi berbasis cloud"), jadi kalau ikut dicek di
-    deskripsi hasilnya kebanjiran false positive (sudah terverifikasi lewat
-    run nyata - lihat catatan histori/commit).
-    Keyword spesifik/frasa (data science, penetration tester, dst) tetap
-    dicek di judul MAUPUN deskripsi karena jauh lebih jarang muncul kebetulan.
+    Keyword generik (it, data, cloud, dst) cuma dicek di judul - kalau ikut
+    dicek di deskripsi, hampir semua lowongan (admin, HR, gudang, dst) ikut
+    lolos karena mereka juga sering menyebut "data"/"IT"/"cloud" secara
+    insidental. Keyword spesifik/frasa (data science, pentester, dst) tetap
+    dicek di judul+deskripsi karena jarang muncul kebetulan.
     """
     generic_patterns, specific_patterns = _get_keyword_patterns()
     title_lower = (title or "").lower()
@@ -237,7 +189,7 @@ def is_relevant(title: str, description: str = "") -> bool:
 
 def detect_work_type(*texts: str) -> str:
     """Deteksi tipe kerja dari judul/deskripsi/lokasi: Remote, Hybrid, On-site,
-    atau "Tidak diketahui" kalau tidak ada penanda sama sekali."""
+    atau "Tidak diketahui" kalau tidak ada penanda."""
     combined = " ".join(t for t in texts if t).lower()
     if not combined:
         return "Tidak diketahui"
@@ -245,7 +197,6 @@ def detect_work_type(*texts: str) -> str:
     def has_any(markers):
         return any(re.search(r"\b" + re.escape(m) + r"\b", combined) for m in markers)
 
-    # Hybrid dicek duluan karena kalimat hybrid sering menyebut remote & on-site sekaligus.
     if has_any(HYBRID_MARKERS):
         return "Hybrid"
     if has_any(REMOTE_MARKERS):
@@ -256,7 +207,7 @@ def detect_work_type(*texts: str) -> str:
 
 
 # =========================================================
-# FILTER TANGGAL POSTING (Agustus-September, dsb sesuai config)
+# FILTER TANGGAL POSTING
 # =========================================================
 _RELATIVE_DATE_PATTERNS = [
     (re.compile(r"(\d+)\s*(?:hari|day)s?\s*(?:yang lalu|ago|lalu)", re.I), "days"),
@@ -267,12 +218,8 @@ _RELATIVE_DATE_PATTERNS = [
 
 
 def parse_posted_date(text: str = "", iso_hint: str = "") -> "date | None":
-    """Coba tentukan tanggal posting lowongan dari:
-    1. `iso_hint`: tanggal absolut/ISO dari API (mis. field created_at Kalibrr).
-    2. `text`: teks bebas dari card (mis. "3 hari yang lalu", "Posted 2 days ago",
-       "Hari ini", "Kemarin").
-    Return None kalau tidak berhasil dideteksi sama sekali.
-    """
+    """Tentukan tanggal posting dari `iso_hint` (tanggal absolut dari API/HTML)
+    atau `text` (relatif, mis. "3 hari yang lalu"). None kalau gagal dideteksi."""
     if iso_hint:
         try:
             return datetime.fromisoformat(iso_hint.replace("Z", "+00:00")).date()
@@ -298,7 +245,7 @@ def parse_posted_date(text: str = "", iso_hint: str = "") -> "date | None":
             if unit == "days":
                 return date.today() - timedelta(days=n)
             if unit == "hours":
-                return date.today()  # dalam hitungan jam -> anggap hari ini
+                return date.today()
             if unit == "weeks":
                 return date.today() - timedelta(weeks=n)
             if unit == "months":
@@ -308,22 +255,17 @@ def parse_posted_date(text: str = "", iso_hint: str = "") -> "date | None":
 
 
 def is_within_target_period(posted: "date | None") -> bool:
-    """Cek apakah tanggal posting ada di rentang bulan target (MONTH_START..MONTH_END,
-    tahun DATE_FILTER_YEAR). Kalau tanggal tidak diketahui, ikuti INCLUDE_UNKNOWN_DATE."""
+    """Cek apakah tanggal posting ada di rentang MONTH_START..MONTH_END/DATE_FILTER_YEAR.
+    Tanggal tidak diketahui -> ikuti INCLUDE_UNKNOWN_DATE."""
     if posted is None:
         return INCLUDE_UNKNOWN_DATE
     return posted.year == DATE_FILTER_YEAR and MONTH_START <= posted.month <= MONTH_END
 
 
 # =========================================================
-# SUMBER 1: KALIBRR (punya endpoint pencarian berbasis JSON)
+# SUMBER 1: KALIBRR (endpoint pencarian JSON)
 # =========================================================
 def scrape_kalibrr(session: requests.Session, query=QUERY, max_pages=MAX_PAGES):
-    """
-    Kalibrr punya endpoint pencarian job board yang mengembalikan JSON.
-    Endpoint ini bisa berubah sewaktu-waktu, jadi kalau tidak jalan,
-    cek ulang lewat browser (buka Network tab pas search di kalibrr.com).
-    """
     results = []
     skipped_not_relevant = 0
     skipped_date = 0
@@ -335,8 +277,8 @@ def scrape_kalibrr(session: requests.Session, query=QUERY, max_pages=MAX_PAGES):
             "q": query,
             "country": "Indonesia",
             "employment_type": "Internship",
-            "limit": limit,   # wajib -> tanpa ini API balas 400 "Missing query parameter 'limit'"
-            "offset": page * limit,  # wajib juga -> API pakai offset, bukan "page"
+            "limit": limit,          # wajib, kalau tidak API balas 400
+            "offset": page * limit,  # API pakai offset, bukan "page"
         }
         try:
             resp = session.get(base_url, params=params, timeout=15)
@@ -361,12 +303,9 @@ def scrape_kalibrr(session: requests.Session, query=QUERY, max_pages=MAX_PAGES):
         for job in jobs:
             title = job.get("name", "") or ""
             description = job.get("description", "") or ""
-            # NB: objek "company" cuma punya code/description, BUKAN "name" -> nama
-            # perusahaan sebenarnya ada di field top-level "company_name".
-            company = job.get("company_name", "") or ""
+            company = job.get("company_name", "") or ""  # bukan job["company"]["name"] - field itu tidak ada
             url = f"https://www.kalibrr.com/c/{job.get('company', {}).get('code','')}/jobs/{job.get('id','')}"
             posted_raw = job.get("created_at") or job.get("activation_date") or ""
-            # NB: "city" nested di dalam address_components, bukan langsung di google_location.
             lokasi = job.get("google_location", {}).get("address_components", {}).get("city", "")
             posted_date = parse_posted_date(iso_hint=posted_raw)
 
@@ -377,8 +316,7 @@ def scrape_kalibrr(session: requests.Session, query=QUERY, max_pages=MAX_PAGES):
                 skipped_date += 1
                 continue
 
-            # Kalibrr expose flag eksplisit is_hybrid/is_work_from_home -> lebih
-            # akurat daripada nebak dari teks judul/deskripsi.
+            # Kalibrr expose flag eksplisit is_hybrid/is_work_from_home -> lebih akurat
             if job.get("is_hybrid"):
                 tipe_kerja = "Hybrid"
             elif job.get("is_work_from_home"):
@@ -386,7 +324,7 @@ def scrape_kalibrr(session: requests.Session, query=QUERY, max_pages=MAX_PAGES):
             else:
                 tipe_kerja = detect_work_type(title, description, lokasi)
                 if tipe_kerja == "Tidak diketahui":
-                    tipe_kerja = "On-site"  # Kalibrr eksplisit set False/False utk kerja di kantor
+                    tipe_kerja = "On-site"
 
             results.append({
                 "sumber": "Kalibrr",
@@ -397,7 +335,7 @@ def scrape_kalibrr(session: requests.Session, query=QUERY, max_pages=MAX_PAGES):
                 "tanggal_posting": posted_date.isoformat() if posted_date else posted_raw,
                 "link": url,
             })
-        time.sleep(1.5)  # jangan spam request
+        time.sleep(1.5)
 
     log.info(
         "[Kalibrr] q=%r: %s cocok, %s di-skip (bukan bidang IT/security), %s di-skip (di luar rentang tanggal)",
@@ -407,30 +345,16 @@ def scrape_kalibrr(session: requests.Session, query=QUERY, max_pages=MAX_PAGES):
 
 
 # =========================================================
-# SUMBER 2: LINKEDIN (guest job search endpoint - publik, tanpa login)
+# SUMBER 2: LINKEDIN (guest job search endpoint, publik tanpa login)
 # =========================================================
-# PENTING soal legal/ToS - BEDA dengan Kalibrr/Glints/Jobstreet:
-# LinkedIn User Agreement (linkedin.com/legal/user-agreement) EKSPLISIT
-# melarang scraping otomatis, bukan cuma proteksi teknis. Endpoint di bawah
-# ini publik (tanpa login, dipakai luas oleh scraper open-source), datanya
-# juga publik (job posting yang memang ditampilkan ke pengunjung anonim),
-# tapi tetap melanggar ketentuan layanan mereka kalau dipakai otomatis.
-# - Jangan jalankan dengan volume besar / terlalu sering -> IP kamu bisa
-#   diblokir sementara oleh LinkedIn.
-# - LINKEDIN_MAX_PAGES sengaja dibikin kecil by default & delay antar
-#   halaman lebih panjang daripada sumber lain.
-# - Kalau mau benar-benar aman secara legal, pertimbangkan pakai LinkedIn
-#   Jobs API resmi (perlu partner access) alih-alih endpoint guest ini.
+# PENTING: User Agreement LinkedIn melarang scraping otomatis (beda dengan
+# sumber lain yang cuma proteksi teknis). Endpoint ini publik & datanya
+# publik, tapi tetap berisiko IP diblokir kalau dipakai agresif - jangan
+# naikkan MAGANG_LINKEDIN_MAX_PAGES sembarangan.
 LINKEDIN_MAX_PAGES = int(os.environ.get("MAGANG_LINKEDIN_MAX_PAGES", "2"))
-LINKEDIN_PAGE_SIZE = 10  # tetap dari API-nya, tidak bisa diubah lewat parameter
-
+LINKEDIN_PAGE_SIZE = 10  # tetap dari API-nya
 
 def scrape_linkedin(session: requests.Session, query=QUERY, max_pages=None):
-    """
-    Endpoint guest LinkedIn ("seeMoreJobPostings") mengembalikan HTML fragment
-    berisi job card, tanpa perlu login. Field yang tersedia lengkap (judul,
-    perusahaan, lokasi, link, tanggal ISO absolut di tag <time datetime>).
-    """
     from bs4 import BeautifulSoup
 
     if max_pages is None:
@@ -502,8 +426,7 @@ def scrape_linkedin(session: requests.Session, query=QUERY, max_pages=None):
                 "link": link,
             })
 
-        # LinkedIn lebih sensitif thd rate-limit daripada sumber lain -> jeda lebih panjang.
-        time.sleep(3)
+        time.sleep(3)  # LinkedIn lebih sensitif thd rate-limit -> jeda lebih panjang
 
     log.info(
         "[LinkedIn] q=%r: %s cocok, %s di-skip (bukan bidang IT/security), %s di-skip (di luar rentang tanggal)",
@@ -513,11 +436,9 @@ def scrape_linkedin(session: requests.Session, query=QUERY, max_pages=None):
 
 
 # =========================================================
-# HELPER SELENIUM (dipakai bareng oleh Glints & Jobstreet, dua-duanya
-# butuh render JS supaya kontennya kebaca / supaya lolos proteksi Cloudflare)
+# HELPER SELENIUM (dipakai bareng Glints & Jobstreet)
 # =========================================================
 def _import_selenium():
-    """Import lazy supaya scraper lain tetap jalan walau selenium belum terinstall."""
     from selenium import webdriver
     from selenium.webdriver.chrome.options import Options
     from selenium.webdriver.chrome.service import Service
@@ -529,8 +450,7 @@ def _import_selenium():
 
 
 def create_chrome_driver(source_name: str):
-    """Bikin Chrome headless driver siap pakai, atau None kalau gagal
-    (selenium belum terinstall / chromedriver gagal start)."""
+    """Bikin Chrome headless driver siap pakai, atau (None, None) kalau gagal."""
     try:
         webdriver, Options, Service, By, EC, WebDriverWait, ChromeDriverManager = _import_selenium()
     except ImportError:
@@ -544,7 +464,7 @@ def create_chrome_driver(source_name: str):
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument(f"user-agent={HEADERS['User-Agent']}")
 
-    # Cache lokasi chromedriver supaya tidak selalu hit network di setiap run.
+    # Cache lokasi chromedriver supaya tidak hit network tiap run
     driver_cache_file = os.path.join(os.path.expanduser("~"), ".cache_scraper_magang_driver_path")
     driver_path = None
     if os.path.exists(driver_cache_file):
@@ -573,9 +493,7 @@ def create_chrome_driver(source_name: str):
 
 
 def load_page_with_retry(driver, url, wait_selector, sel, source_name, page, timeout=15, tries=2):
-    """`driver.get(url)` + tunggu elemen muncul, dicoba ulang `tries` kali kalau
-    timeout/gagal (koneksi lambat, render telat, dsb) sebelum benar-benar nyerah.
-    Return True kalau berhasil, False kalau semua percobaan gagal."""
+    """driver.get(url) + tunggu elemen muncul, retry `tries` kali. Return True/False."""
     By, EC, WebDriverWait = sel
     for attempt in range(1, tries + 1):
         try:
@@ -595,14 +513,9 @@ def load_page_with_retry(driver, url, wait_selector, sel, source_name, page, tim
 
 
 # =========================================================
-# SUMBER 3: GLINTS (butuh render JS -> pakai Selenium)
+# SUMBER 3: GLINTS (butuh render JS -> Selenium)
 # =========================================================
 def scrape_glints(query=QUERY, max_pages=2):
-    """
-    Glints render kontennya lewat JavaScript, jadi requests biasa
-    biasanya cuma dapat halaman kosong. Kita pakai Selenium headless.
-    Kalau tidak mau install Selenium, fungsi ini bisa dilewati saja.
-    """
     results = []
     skipped_not_relevant = 0
     skipped_date = 0
@@ -625,25 +538,18 @@ def scrape_glints(query=QUERY, max_pages=2):
                 log.warning("[Glints] Halaman %s kelihatan seperti proteksi anti-bot, berhenti.", page)
                 break
 
-            # PENTING: jangan pakai selector generik "[class*='JobCard']" -> itu
-            # cocok dengan BEBERAPA wrapper bersarang punya nama sama untuk 1
-            # lowongan yang sama (JobcardContainer, JobCardWrapper, CompactJobCard,
-            # dst semua mengandung substring "JobCard"), jadi tiap lowongan
-            # kehitung 3x. "JobcardContainer" adalah wrapper terluar yang unik.
+            # "[class*='JobCard']" match beberapa wrapper bersarang sekaligus (duplikat!)
+            # -> pakai "JobcardContainer", wrapper terluar yang unik per lowongan.
             cards = driver.find_elements(By.CSS_SELECTOR, "[class*='JobcardContainer']")
             if not cards:
                 log.info("[Glints] Halaman %s tidak ada job card, anggap sudah habis.", page)
                 break
 
             for card in cards:
-                # NB: Glints pakai styled-components dengan hash class acak (mis.
-                # "CompactOpportunityCardsc__JobTitle-sc-dkg8my-11 kpFYNG"), jadi
-                # kita match prefix nama komponennya (stabil), bukan hash-nya.
-                # Diverifikasi langsung dari DOM asli per 2026-09-07 - kalau Glints
-                # redesign, selector ini perlu diupdate lagi.
-                # "JobCardTitleNoStyleAnchor" dipakai (bukan "JobTitle" polos) karena
-                # "JobTitle" juga match wrapper "JobTitleSalaryWrapper" yang teksnya
-                # ikut kebawa info gaji.
+                # Class Glints pakai styled-components (hash acak) - match prefix
+                # nama komponennya. "JobCardTitleNoStyleAnchor" dipakai (bukan
+                # "JobTitle" polos) karena "JobTitle" juga match wrapper yang
+                # teksnya kebawa info gaji.
                 try:
                     title_el = card.find_element(By.CSS_SELECTOR, "[class*='JobCardTitleNoStyleAnchor']")
                     title = title_el.text
@@ -669,7 +575,7 @@ def scrape_glints(query=QUERY, max_pages=2):
                     except Exception:
                         continue
 
-                description = card.text  # fallback: seluruh teks card, dipakai buat filter tambahan
+                description = card.text
 
                 posted_text = ""
                 for css_sel in ["[class*='UpdatedTimeContainer']", "[class*='OpportunityMeta']"]:
@@ -702,7 +608,7 @@ def scrape_glints(query=QUERY, max_pages=2):
                     "link": link,
                 })
 
-            time.sleep(2)  # jangan spam request antar halaman
+            time.sleep(2)
     except Exception as e:
         log.error("[Glints] Error saat scraping: %s", e)
     finally:
@@ -716,17 +622,9 @@ def scrape_glints(query=QUERY, max_pages=2):
 
 
 # =========================================================
-# SUMBER 4: JOBSTREET / SEEK ID (butuh render JS + tembus Cloudflare -> Selenium)
+# SUMBER 4: JOBSTREET / SEEK ID (full-JS + Cloudflare -> Selenium)
 # =========================================================
 def scrape_jobstreet(query=QUERY, max_pages=2):
-    """
-    Jobstreet Indonesia (bagian dari SEEK) full-JS render dan halamannya
-    ditutupi Cloudflare -> request polos (`requests`) selalu dibalas 403
-    "Just a moment..." apapun header-nya (sudah dicoba & dikonfirmasi).
-    Jadi sumber ini, sama seperti Glints, pakai Selenium headless.
-    Selector data-automation di bawah sudah diverifikasi langsung dari DOM
-    render per 2026-09-07 - kalau Jobstreet redesign, update di sini.
-    """
     results = []
     skipped_not_relevant = 0
     skipped_date = 0
@@ -779,7 +677,7 @@ def scrape_jobstreet(query=QUERY, max_pages=2):
                 except Exception:
                     pass
 
-                description = card.text  # fallback: seluruh teks card, dipakai buat filter tambahan
+                description = card.text
                 posted_date = parse_posted_date(text=posted_text or description)
 
                 if not title or not is_relevant(title, description):
@@ -799,7 +697,7 @@ def scrape_jobstreet(query=QUERY, max_pages=2):
                     "link": link,
                 })
 
-            time.sleep(2)  # jangan spam request antar halaman
+            time.sleep(2)
     except Exception as e:
         log.error("[Jobstreet] Error saat scraping: %s", e)
     finally:
@@ -828,10 +726,8 @@ def main():
 
     session = build_session()
 
-    # Tiap sumber dijalankan sekali PER query di QUERIES, hasilnya digabung &
-    # di-dedup di akhir. Ini penting: KEYWORDS cuma memfilter hasil yang situs
-    # balikin, jadi supaya lowongan cybersecurity/data juga ketemu, query
-    # pencariannya sendiri harus relevan (bukan cuma "magang it").
+    # Tiap sumber dijalankan per query di QUERIES, hasilnya digabung & di-dedup
+    # di akhir - supaya lowongan cybersecurity/data juga ketemu (bukan cuma "magang it").
     jobs = []
     for query in QUERIES:
         jobs.append((f"Kalibrr [{query}]", lambda q=query: scrape_kalibrr(session, query=q, max_pages=MAX_PAGES)))
@@ -846,7 +742,6 @@ def main():
             log.info("[%s] Dapat %s lowongan relevan.", name, len(data))
             all_results.extend(data)
         except Exception as e:
-            # Satu sumber/query gagal tidak boleh menggagalkan yang lain.
             log.error("[%s] Gagal total, dilewati: %s", name, e)
 
     if not all_results:
@@ -857,8 +752,8 @@ def main():
         return
 
     df = pd.DataFrame(all_results)
-    # Normalisasi supaya dedup tidak kecolongan gara-gara whitespace/case beda,
-    # atau link yang sama tapi beda query-string tracking (utm_referrer, traceInfo, dst).
+    # Normalisasi biar dedup tidak kecolongan whitespace/case beda atau
+    # link sama tapi beda query-string tracking (utm_referrer, traceInfo, dst)
     if "link" in df.columns:
         df["link_key"] = df["link"].fillna("").str.split("?").str[0].str.strip().str.lower()
     for col in ["posisi", "perusahaan"]:
