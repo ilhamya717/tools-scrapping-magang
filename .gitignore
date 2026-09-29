@@ -1,16 +1,14 @@
-# Hasil scraping (jangan ikut di-commit, dibuat ulang tiap run)
+
 hasil_magang_*.xlsx
 
-# Python
 __pycache__/
 *.pyc
 .venv/
 venv/
 
-# Debug dump (kalau MAGANG_RAW_DIR dipakai)
+
 raw_dump/
 
-# OS/editor
 .DS_Store
 Thumbs.db
 .vscode/
